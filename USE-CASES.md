@@ -17,6 +17,54 @@ use cases.
 It is a descriptive catalogue: it records what the uses are and why, not how they could be served
 without specialization. All code shown is distilled from real sources.
 
+Each section below covers one distinct use, with a real example and a note on why that use is worth
+calling out separately.
+
+## Methodology
+
+Uses were collected from four places.
+
+**The standard library.** Every specialized trait in `std` was inventoried by hand from source at a
+pinned revision, with per-trait line cites.
+
+**crates.io, exhaustively.** Every published crate was downloaded, streamed, and scanned for the
+feature gates and for `default fn` / `default impl` / `default type`. 2324 crates matched some
+marker; 1459 of those have no feature gate at all, and since `default fn` is gated syntax that
+cannot compile without one, those matches are comments, string literals and identifiers — noise.
+That leaves **865 crates that really enable specialization**, which split in two:
+
+- **350 author specialization themselves** — they write the `default` impl. These are the source of
+  the use cases here.
+- **515 enable the feature but write no `default`** — they enable it only so that coherence will
+  accept an impl of theirs that overlaps *someone else's* blanket default. Roughly 248 of these are
+  downstream of one trait, Solana's `AbiExample`.
+
+For each of the 350, tooling extracted the specialized trait declaration, its full impl family, and
+the blanket/override pair, all sliced from real source. A stratified sample of **159 of them was
+classified by hand**; the 142 that turned out to carry a real use are the rows of
+[USE-CASE-INDEX.md](USE-CASE-INDEX.md). The 26 auto-published `rustc-ap-*` / `ra-ap-*` compiler
+crates were excluded as not ecosystem usage.
+
+**GitHub.** The same markers were searched across GitHub and cross-referenced against the crates.io
+repositories, yielding 803 matching repositories with no crates.io publication. These turned out to
+be dominated by `rust`/`std` forks, committed vendor directories, forks of published frameworks,
+and blockchain applications inheriting `frozen-abi`. They reinforced the categories below rather
+than adding to them.
+
+**Stated demand.** Shipped code understates the demand, because the uses specialization cannot yet
+express leave no code behind. Three further sweeps covered that: forum and tracker threads asking
+for specialization; crates that fake it on stable (autoref/`spez` tricks, `TypeId` + `transmute`,
+negative-reasoning marker traits); and crates that wrote the specialization but keep it behind a
+nightly cfg or a comment saying "delete this when specialization lands". The four use cases in the
+2026 project-goals document are included here as well.
+
+A few caveats. The scan and extraction are regex-driven, good for bucketing but not a parser. Crate
+counts over-weight frameworks — one extension point accounts for ~248 of the 865. And the
+hand-classified sample is ~48% of authors, so treat proportions as shape, not census.
+
+
+***NOTE:** Initial classifications were done by an LLM, and several rounds of refinement resulted in the current classification criteria. Use cases were selected through a mix of manually identifying key known examples, as well as picking representative use cases for different combinations of classification criteria (mixed between LLM- and human-chosen examples). Final classifications for examples listed were human-decided. Commentary on each example is large human-written, but some LLM-written with human-revision. Background, methodology, and overview sections were largely LLM-written with human editing and review.
+
 ## Categorization Overview
 
 
@@ -99,6 +147,8 @@ impl Dot for [f32] {
 
 The `acgmath` crate actually supports SIMD for *custom* types through specialization.
 
+**Why it's here:** This is the plainest case, and the one people reach for first: one algorithm, written generically, with a hand-tuned path for the types that have one. Usually, calling the "wrong" impl is mild: it's only a performance loss. However, that exact fact makes it hard to know that the specialized impl is used and the mirrored behavior would need to be maintained over time.
+
 ---
 
 ## A marker trait flags the fast path
@@ -125,6 +175,8 @@ impl<T, I: TrustedLen<Item = T>> SpecExtend<T, I> for Vec<T> {
 Similar specialization is done for `Copy` (actually `TrivialClone`, which is implemented for a known set) to bypass individual-element cloning in favor of mem-copying a slice.
 
 This latter case also shows up similarly in the ecosystem quite often. `cpython` (and previously `pyo3`) use specialization in a similar manner, creating a `Vec` from a *buffer* more performantly than from a general *sequence*.
+
+**Why it's here:** This is the next plainest case: a fast path keyed not on type *identity*, but on type *capability*.
 
 ---
 
@@ -164,6 +216,8 @@ impl SpecFromElem for u8 {
 ```
 
 Surprisingly, this doesn't come up much otherwise.
+
+**Why it's here:** This is the simplest case that mixes specialization on both type identity and capability; and so, any alternative features that target *only one* of those would need to be *mixed*, whereas specialization/min_specialization handle this "trivially".
 
 ---
 
@@ -215,6 +269,8 @@ unsafe impl<I: Iterator> StepByImpl<I> for StepBy<I> {
 unsafe impl StepByImpl<Range<$t>> for StepBy<Range<$t>> { ... }
 ```
 
+**Why it's here:** This pattern is the exception to the rule that specialization is a local decision. Importantly, it means that we need to consider if specialization is applied *consistently*, as opposed to "just" yes or no.
+
 ---
 
 ## Non-correctness behavioral opt-in
@@ -238,6 +294,8 @@ impl<T: fmt::Debug> fmt::Debug for DebugIt<T> {
 ```
 
 This pattern comes up extremely often, sometimes applying to `Display` or otherwise. In the standard library, it's very rarely used, with one exception for panic message printing of `BTreeMap`/`BTreeSet`.
+
+**Why it's here:** This is the first case where the specialized impl produces an observably *different* result, not just a faster one. The difference is only cosmetic, though, so it still doesn't matter whether specialization applies consistently. It is worth noting mostly because it is, by count, the most common use in the whole ecosystem.
 
 ---
 
@@ -267,6 +325,22 @@ impl FromResidual<Result<Infallible, Error>> for CustomActionResult {
 ```
 
 This is also desired for porting C++ libraries, like [abseil](https://abseil.io/docs/cpp/guides/status).
+
+Note that `msica` can only do this because both the trait impls and the target type are its own. To
+get the same behavior on the standard library's `Result` (which is what people usually want, and
+what a `StatusOr`-style port would need), `std` would have to mark the method in its own blanket
+impl as `default fn`:
+
+```rust
+impl<T, E, F: From<E>> ops::FromResidual<Result<convert::Infallible, E>> for Result<T, F> {
+    default fn from_residual(residual: Result<convert::Infallible, E>) -> Self { ... }
+}
+```
+
+Nothing downstream can opt into this; it is a decision `std` makes per method, and a semver-visible
+one, since marking a method `default` is a promise that it can be overridden.
+
+**Why it's here:** This is the first case where the crate that wants the override does not own the blanket impl: `std` does. So the interesting question is less about what specialization can express than about whether `std` is willing to mark its own methods `default fn`: a per-method, semver-visible choice, distinct from turning specialization on at all.
 
 ---
 
@@ -300,6 +374,8 @@ impl Decode for Vec<u8> {
 
 This is also a pretty common pattern, found in codecs, serializers, numeric libraries, and language bindings.
 
+**Why it's here:** This is where the observably different result becomes *correctness*-relevant: the byte-string encoding is the right one for `Vec<u8>`, so a missed specialization is a bug rather than a slowdown. Unlike `StepBy`, though, the decision is still *local*: each value is encoded on its own, so the only thing that matters is whether specialization applies, not whether it applies consistently.
+
 ---
 
 ## In-place deserialization
@@ -319,6 +395,8 @@ impl<const N: usize> ParquetData for Box<[u8; N]> {
     type Reader = BoxFixedLenByteArrayReader<[u8; N]>;
 }
 ```
+
+**Why it's here:** This is the first case where the override changes a *type* rather than a value. That makes it observable at compile time, so any alternative feature that reasons only about runtime behavior cannot cover it.
 
 ---
 
@@ -350,11 +428,13 @@ First, this seems like it is a substitute for reflection of some kind.
 Second, this crate had the largest footprint in the survey: roughly 248 Solana consumers and
 chain forks enable specialization solely to host a derived override.
 
+**Why it's here:** This is the most widely-deployed use found, but is basically just a workaround for being able to query the recursive layout of a type.
+
 ---
 
 ## Bounds on Drop
 
-Motivation: workaround
+Motivation: correctness, workaround
 Overlap: capability
 
 You cannot bound a `Drop` impl (E0367), so `linux-support` routes `Drop` through a specializable
@@ -369,6 +449,8 @@ impl<R, F> Drop for Socket<R, F> { fn drop(&mut self) { self.spec_drop() } }
 ```
 
 A few other crates do similar things. There is orthogonal work to have better control over Drop semantics, so this is mostly just a workaround.
+
+**Why it's here:** This is a similar pattern to much of std, where the specialization is not on the (`Drop`) impl itself, but rather on a specializable trait. While the behavior is correctness-based, the pattern itself is a workaround for not being able to specialize on `Drop`.
 
 ---
 
@@ -387,6 +469,8 @@ impl<T> MaybeFilter<T> for T { type Output = Option<T>; /* .. */ }
 
 There are also a small number of other crates that use specialization for type-level richness.
 
+**Why it's here:** This pattern shows that associated type specialization can result in richer libraries, resulting in cleaner code without potential extra runtime overhead.
+
 ---
 
 ## Type equality as the answer
@@ -403,6 +487,8 @@ impl<T> Cast<T> for T   { fn cast(self) -> Result<T, Self> { Ok(self) } }
 
 `specialize` exposes the same as `obj.is::<T>()`; `metatype` recovers a type's kind. On stable people
 fake it with `TypeId` and `castaway`.
+
+**Why it's here:** This case asks only whether two types are *equal* and returns that fact as its answer. This is essentially reflection.
 
 ---
 
@@ -432,6 +518,8 @@ impl<T> Ctor for fn(*mut T) {
 }
 ```
 
+**Why it's here:** This is a similar pattern that uses richer library features to specifically target performance.
+
 ---
 
 ## A base implementation, overridden down a type hierarchy
@@ -457,3 +545,5 @@ default impl<T: FilterDirectory> Directory for T {
 impl Directory for FSDirectory { /* a real on-disk directory */ }
 impl<D: Directory, RL> Directory for RateLimitFilterDirectory<D, RL> { /* rate-limits writes, delegates the rest */ }
 ```
+
+**Why it's here:** This was one of specialization's original motivations, yet the survey found strikingly little of it. This is the pattern that essentially just translates a Java-like class inheritance into Rust.
