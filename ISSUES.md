@@ -86,6 +86,9 @@ Two issues in this area are *not* lifetime-blindness and would not be fixed by i
 are subtype/supertype coercion of HRTB function pointers across a covariant type, where both types
 are already `'static`.
 
+An alternative does exist: the always-applicable rule can be dropped if the specialization decision
+is made during *analysis* (where regions are still known) rather than at codegen.
+
 ### 2. `default type` is not projectable
 
 Generic code cannot rely on a `default` associated type's value, because a downstream impl may
@@ -141,10 +144,11 @@ a breaking change.
 
 ### 6. Specialization needs a decidable answer at monomorphization
 
-#147507 and #96235: when the predicate guiding a specializing impl returns ambiguity (an inductive
-cycle, or a `#[marker]` trait's union of impls), `Instance::resolve` has no ambiguity outcome and
-ICEs. lcnr, in thread: "a pretty big and fundamental issue with specialization". Not fixed by the
-new solver. `try_as_dyn` inherits this rather than escaping it, since it runs the same solver
+#147507 (an inductive cycle) and #96235 (a `#[marker]` trait's union of impls) both drive
+monomorphization to a specialization query with no unique answer, which nothing downstream handles,
+so it ICEs, in `Instance::resolve` and the monomorphize collector respectively. Distinct panic
+sites, one gap. lcnr, in thread: "a pretty big and fundamental issue with specialization". Not fixed
+by the new solver. `try_as_dyn` inherits this rather than escaping it, since it runs the same solver
 (#151440 cross-references #147507 explicitly).
 
 ### 7. Adding a blanket impl is a breaking change regardless of `default`
@@ -152,9 +156,27 @@ new solver. `try_as_dyn` inherits this rather than escaping it, since it runs th
 aturon's 2017 result, reached after the hope that `default` could make blanket impls safe to add.
 A downstream impl may be justified by the *absence* of an upstream one, so `default` cannot serve as
 a "safe to add later" marker and specialization does not buy back the `#[fundamental]` restriction.
-This is what blocks the std API issues: #52454, #45742, #129039. Of those, only #45742 genuinely
-needs new language features: it requires intersection or lattice impls, since the concrete impls
-overlap the `Deref` blanket without being a subset of it.
+
+There are three std API changes cited here as "blocked on specialization": #52454, #45742, #129039.
+Each are "blocked" by a *different* mechanism:
+
+- **#52454** (mark core's `Into::into` `default`) does not add a blanket at all: the blanket already
+  exists, its method was stabilized without `default` (so overriding it is E0520), and adding
+  `default` now weakens downstream inference (a consequence of root cause 4). It is blocked on *stable
+  specialization plus the permanence of the `default` choice*, not on a missing feature.
+- **#129039** (`PartialOrd<[U]> for [T]`) is a **min_specialization limitation**: giving
+  `SlicePartialOrd` the right-hand-side parameter it needs makes the `AlwaysApplicableOrd` fast path
+  map two parent parameters to one, which min_spec's `check_duplicate_params` rejects ("specializing
+  impl repeats parameter `A`") even though **full specialization accepts it** (verified: the MCVE
+  compiles under `feature(specialization)`, fails only under `min_specialization`). No
+  breaking-change hazard and no new feature; the fix is to relax or parameterize the min_spec rule.
+- **#45742** (AsRef/AsMut over `Deref`) is the only one that genuinely needs a new language feature:
+  the proposed blanket overlaps existing impls without being a superset, so chain-rule specialization
+  cannot order them, so it needs **intersection/lattice impls**.
+
+So this root cause is real as a stabilization obstacle, but of the three it is only loosely the
+blocker for #45742 (via coherence) and not the blocker for #52454 (inference/permanence) or #129039
+(a min_spec strictness the full feature does not share).
 
 ## Cross-feature interactions
 
@@ -180,6 +202,9 @@ design must account for work in flight.
   <https://smallcultfollowing.com/babysteps/blog/2018/02/09/maximally-minimal-specialization-always-applicable-impls/>
 - aturon, *Sound and ergonomic specialization for Rust*, 2018-04-05:
   <http://aturon.github.io/tech/2018/04/05/sound-specialization/>
+- lcnr, *On always-applicable trait impls*, 2026-03-06 (argues the always-applicable rule is not
+  needed; resolve specialization during analysis via caller-propagated `maybe` bounds instead):
+  <https://lcnr.de/blog/2026/03/06/always-applicable.html>
 - nikomatsakis, *Supporting blanket impls in specialization*, 2016-10-24
 - rust-lang/chalk#9: two encodings of specialization in the logic engine
 - rust-lang/types-team#89, #119: "path towards MVP stabilization (if any)"
@@ -259,7 +284,7 @@ The tracking issue #31844 is the parent of all of these and is not repeated as a
 |---|---|---|---|---|---|---|
 | [#32483](https://github.com/rust-lang/rust/issues/32483) | open | fixed | `def-type` `spec` |  | landed | Specialization: allow some projection when… |
 | [#50318](https://github.com/rust-lang/rust/issues/50318) | open | fixed | `def-type` `def-impl` `spec` |  | landed | assigning associated type in a default impl… |
-| [#52396](https://github.com/rust-lang/rust/issues/52396) | open | changed | `def-impl` `spec` |  | blocked: partial-impl-vs-default-impl | Default impls cannot take into account… |
+| [#52396](https://github.com/rust-lang/rust/issues/52396) | open | fixed | `def-impl` `spec` |  |  | Default impls cannot take into account… |
 | [#46707](https://github.com/rust-lang/rust/issues/46707) | open | repro | `def-type` `spec` |  | needs sealed/final-impl analysis | associated types are not evaluated even on… |
 | [#85228](https://github.com/rust-lang/rust/issues/85228) | open | repro | `def-type` `spec` |  |  | Specialization on associated type |
 | [#98389](https://github.com/rust-lang/rust/issues/98389) | open | repro | `def-type` `spec` |  |  | Specialized associated type doesn't have… |
@@ -293,12 +318,12 @@ The tracking issue #31844 is the parent of all of these and is not repeated as a
 | [#126268](https://github.com/rust-lang/rust/issues/126268) | open | repro | `min-spec` | #102252 | needs next-solver | assertion failed: !obligations.has_infer() in… |
 | [#103708](https://github.com/rust-lang/rust/issues/103708) | open | repro | `min-spec` |  | blocked: impl_wf_check permits unconstrained lifetime params | min_specialization ICE is not fully resolved… |
 | [#157731](https://github.com/rust-lang/rust/issues/157731) | open | repro | `min-spec` `assumptions` `next-solver` | #103708 |  | assumptions on binders: is not fully resolved |
-| [#96235](https://github.com/rust-lang/rust/issues/96235) | open | no-repro | `spec` `std` `marker` `attrs` `no-mcve` | #147507 |  | in rustc_monomorphize/src/collector.rs when… |
+| [#96235](https://github.com/rust-lang/rust/issues/96235) | open | no-repro | `spec` `std` `marker` `attrs` `no-mcve` |  |  | in rustc_monomorphize/src/collector.rs when… |
 | [#150387](https://github.com/rust-lang/rust/issues/150387) | open | repro | `both` |  | prop: forbid specializing Drop impls | from specializing Drop impl with impossible… |
 | [#147507](https://github.com/rust-lang/rust/issues/147507) | open | repro | `spec` |  |  | from inductive cycle in specialization |
 | [#102252](https://github.com/rust-lang/rust/issues/102252) | open | repro | `min-spec` `attrs` |  | needs next-solver | rustc_specialization_trait and circular… |
 | [#119344](https://github.com/rust-lang/rust/issues/119344) | open | repro | `spec` |  |  | query cycle: cycle detected when building… |
-| [#125014](https://github.com/rust-lang/rust/issues/125014) | open | changed | `def-type` `spec` |  | needs next-solver | :coherence: impl was matchable against Binder… |
+| [#125014](https://github.com/rust-lang/rust/issues/125014) | open | next-solver | `def-type` `spec` |  | next-solver | :coherence: impl was matchable against Binder… |
 
 ## ICEs in downstream consumers, and compiler hangs
 
@@ -317,8 +342,8 @@ The tracking issue #31844 is the parent of all of these and is not repeated as a
 | # | state | status | tags | dupe of | fix | place |
 |---|---|---|---|---|---|---|
 | [#33481](https://github.com/rust-lang/rust/issues/33481) | open | repro | `def-type` `spec` |  |  | Unhelpful error message for… |
-| [#55140](https://github.com/rust-lang/rust/issues/55140) | open | repro | `def-impl` `both` | #90665 |  | One of the E0599 notes disappears when… |
-| [#58809](https://github.com/rust-lang/rust/issues/58809) | open | changed | `def-impl` `spec` `fn-traits` `fnonce` |  |  | Specialized FnOnce impl compiles failed with… |
+| [#55140](https://github.com/rust-lang/rust/issues/55140) | open | repro | `def-impl` `both` |  |  | One of the E0599 notes disappears when… |
+| [#58809](https://github.com/rust-lang/rust/issues/58809) | open | changed | `def-impl` `spec` `fn-traits` `fnonce` | #85228 |  | Specialized FnOnce impl compiles failed with… |
 | [#90665](https://github.com/rust-lang/rust/issues/90665) | open | repro | `both` `attrs` |  | needs keep nested-obligation info when winnowing yields zero candidates | Diagnostic forgets about transitive trait… |
 | [#97296](https://github.com/rust-lang/rust/issues/97296) | open | changed | `min-spec` |  | needs explain-rustc_specialization_trait-restriction | Diagnostic regression when rustc cannot… |
 | [#117841](https://github.com/rust-lang/rust/issues/117841) | open | repro | `def-type` `spec` |  |  | Invalid help suggestion for specialization on… |
@@ -389,7 +414,7 @@ The tracking issue #31844 is the parent of all of these and is not repeated as a
 | [#135103](https://github.com/rust-lang/rust/issues/135103) | open | fixed | `min-spec` `std` |  | #135104 | The implementation of InPlaceIterable for… |
 | [#92488](https://github.com/rust-lang/rust/issues/92488) | open | fixed | `min-spec` `tra` |  | landed | no region-bound-pairs for HirId when… |
 | [#155252](https://github.com/rust-lang/rust/issues/155252) | open | repro | `next-solver` |  |  | Got a scalar pair where a scalar… |
-| [#130799](https://github.com/rust-lang/rust/issues/130799) | open | repro | `def-type` `spec` `adt-const` |  | blocked: const-generic-exhaustiveness | [adt_const_params] consider to avoid using… |
+| [#130799](https://github.com/rust-lang/rust/issues/130799) | open | repro | `adt-const` (spec is only a workaround) |  | blocked: const-generic-exhaustiveness | [adt_const_params] consider to avoid using… |
 | [#85731](https://github.com/rust-lang/rust/issues/85731) | open |  | `min-spec` `std` `trusted-step` `no-mcve` |  | blocked: min_specialization | trusted_step |
 | [#88901](https://github.com/rust-lang/rust/issues/88901) | closed | fixed | `min-spec` `std` |  | #105102 | A Lifetime-generic Copy impl can allow fields… |
 | [#122420](https://github.com/rust-lang/rust/issues/122420) | closed | fixed |  |  | #122461 | UB in <Range as Iterator>::advance_by… |
@@ -400,7 +425,7 @@ The tracking issue #31844 is the parent of all of these and is not repeated as a
 
 59 reports that never got an issue number, triaged as duplicate, not-a-bug, design discussion, or genuinely unreported.
 
-59 reports, `U005`–`U317`, 2016-03-23 … 2025-03-24. None of them was ever given its own issue
+59 reports, `U005`-`U317`, 2016-03-23 … 2025-03-24. None of them was ever given its own issue
 number. `state` is recorded as `UNFILED` throughout (the containing tracking issue #31844 is open).
 
 ### Summary

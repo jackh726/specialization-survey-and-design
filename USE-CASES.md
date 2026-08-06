@@ -55,8 +55,9 @@ than adding to them.
 express leave no code behind. Three further sweeps covered that: forum and tracker threads asking
 for specialization; crates that fake it on stable (autoref/`spez` tricks, `TypeId` + `transmute`,
 negative-reasoning marker traits); and crates that wrote the specialization but keep it behind a
-nightly cfg or a comment saying "delete this when specialization lands". The four use cases in the
-2026 project-goals document are included here as well.
+nightly cfg or a comment saying "delete this when specialization lands". When a wish matched a use
+that already exists, the relevant section below is reinforced. The four use cases in the 2026
+project-goals document are included here as well.
 
 A few caveats. The scan and extraction are regex-driven, good for bucketing but not a parser. Crate
 counts over-weight frameworks — one extension point accounts for ~248 of the 865. And the
@@ -226,7 +227,7 @@ Surprisingly, this doesn't come up much otherwise.
 Motivation: performance
 Overlap: concrete type
 
-In the standard library, `Iterator::step_by` is optimized for `StepBy<Range<{integer}>>`. However, to do this, the `StepBy` struct is set up in a specialized way that is relied upon in the specialized impl used for iteration. Thus, if the *setup* is called without specialization but the *iteration* is (or vice versa), this could lead to either unsoundness or incorrectness.
+In the standard library, `Iterator::step_by` is optimized for `StepBy<Range<{integer}>>`. Two separate things are specialized, and the fast path is correct only if they agree. When a `StepBy` is *created* by `step_by()`, `SpecRangeSetup::setup` rewrites the inner `Range`'s `end` field into an iteration counter. Later, on every `next()`, `StepByImpl::spec_next` reads that field back as the counter it was rewritten into. If `setup` takes the specialized path but `spec_next` takes the generic one (or the reverse), `next` misreads the field: the two impls must be selected consistently.
 
 Most uses of specialization do not rely on specialization holding *consistently* for correctness or soundness (though, that's not the same as requiring that specialization holds *always*). `StepBy` is one of the few cases where the type's validity requires the consistent application of specialization.
 
@@ -237,23 +238,28 @@ struct StepBy<I> {
 }
 impl<I> StepBy<I> {
     fn new(iter: I, step: usize) -> StepBy<I> {
-        let iter = <I as SpecRangeSetup<I>>::setup(iter, step);
+        let iter = <I as SpecRangeSetup<I>>::setup(iter, step);   // rewrites Range::end for int ranges
         StepBy { iter, ... }
     }
 }
+
+// The public Iterator impl forwards straight to the specialized trait:
+impl<I: Iterator> Iterator for StepBy<I> {
+    type Item = I::Item;
+    fn next(&mut self) -> Option<I::Item> { self.spec_next() }
+    ...
+}
+
 trait SpecRangeSetup<T> {
     fn setup(inner: T, step: usize) -> T;
 }
-
 impl<T> SpecRangeSetup<T> for T {
-    #[inline]
-    default fn setup(inner: T, _step: usize) -> T {
-        inner
-    }
+    default fn setup(inner: T, _step: usize) -> T { inner }        // no-op for a general iterator
 }
+// `$t` is a macro variable: this impl is stamped once per integer type (u8, u16, ..., i64, ...).
 impl SpecRangeSetup<Range<$t>> for Range<$t> {
     fn setup(mut r: Range<$t>, step: usize) -> Range<$t> {
-        ...
+        ... // turn r.end into the iteration counter that spec_next below relies on
     }
 }
 
@@ -264,12 +270,13 @@ unsafe trait StepByImpl<I> {
 }
 unsafe impl<I: Iterator> StepByImpl<I> for StepBy<I> {
     type Item = I::Item;
-    default fn spec_next(&mut self) -> Option<I::Item> { ... }
+    default fn spec_next(&mut self) -> Option<I::Item> { ... }     // generic: self.iter.nth(step)
 }
+// again stamped per integer type `$t`; reads the counter that setup() wrote:
 unsafe impl StepByImpl<Range<$t>> for StepBy<Range<$t>> { ... }
 ```
 
-**Why it's here:** This pattern is the exception to the rule that specialization is a local decision. Importantly, it means that we need to consider if specialization is applied *consistently*, as opposed to "just" yes or no.
+**Why it's here:** This pattern is the exception to the rule that specialization is a local decision. The consistency it needs is specific: the impl chosen when the `StepBy` is *built* by `step_by()` (running `SpecRangeSetup::setup`) and the impl chosen on every later `next()` (running `spec_next`) must be the same one, because the second reads a field the first reformatted. So here the question is not just whether specialization applies, but whether it applies consistently across the value's lifetime.
 
 ---
 
@@ -383,7 +390,7 @@ This is also a pretty common pattern, found in codecs, serializers, numeric libr
 Motivation: performance & correctness
 Overlap: concrete types
 
-Sometimes, crates want to fallback to the *safe* path for correctness, but allow a faster path in the face of problems. In the case of `amadeus-parquet`, types are transparently boxed to prevent overflow. And parsed arrays are deserialized directly into a `Box` to prevent large values from being placed on the stack. This is also decided at *compile-time* using `default type` specialization.
+`amadeus-parquet` reads each record type through an associated `Schema` and `Reader`, and picks those two *types* per record type. A blanket impl for `Box<T>` derives them from `T`'s own schema and reader; an impl for a boxed fixed-size byte array, `Box<[u8; N]>`, overrides them so the bytes are read straight into the heap allocation instead of being built as a large `[u8; N]` on the stack first. Because the override changes an associated *type* rather than a value, the whole choice is made at compile time via `default type`.
 
 ```rust
 impl<T: ParquetData> ParquetData for Box<T> {
@@ -421,14 +428,20 @@ impl<T: AbiExample> AbiExample for Option<T> {
 struct Foo;
 ```
 
-Two things to note about this crate:
+Three things to note about this crate:
 
-First, this seems like it is a substitute for reflection of some kind.
+First, this seems like it is a substitute for reflection of some kind; what `solana-frozen-abi`
+wants to do is inspect the a struct's fields recursively and know if they change, recursively.
 
-Second, this crate had the largest footprint in the survey: roughly 248 Solana consumers and
+Second, it's possible that this use of specialization isn't needed. It seems that specialization
+is used to avoid compile-time errors when foreign types are used in a derived struct (instead
+opting for a test-time error).
+
+Third, this crate had the largest footprint in the survey: roughly 248 Solana consumers and
 chain forks enable specialization solely to host a derived override.
 
-**Why it's here:** This is the most widely-deployed use found, but is basically just a workaround for being able to query the recursive layout of a type.
+**Why it's here:** This is the most widely-deployed use found, but is basically just a workaround
+for being able to query the recursive layout of a type.
 
 ---
 
@@ -489,36 +502,6 @@ impl<T> Cast<T> for T   { fn cast(self) -> Result<T, Self> { Ok(self) } }
 fake it with `TypeId` and `castaway`.
 
 **Why it's here:** This case asks only whether two types are *equal* and returns that fact as its answer. This is essentially reflection.
-
----
-
-## Extendable in-place initialization
-
-Motivation: richer-libs & performance
-Overlap: concrete types
-
-Crubit's `Ctor` trait has similar aspirations. Certain types want to be able to implement in-place initialization in different manners. Any type can be constructed to a destination itself; but, some types like `fn(*mut T)` can construct a value of `T`:
-
-```rust
-pub unsafe trait Ctor: Sized {
-    type Output: ?Sized;
-    unsafe fn ctor(self, dest: *mut Self::Output);
-}
-impl<T> Ctor for T {
-    type Output = T;
-    default unsafe fn ctor(self, dest: *mut Self::Output) {
-        dest.write(self);
-    }
-}
-impl<T> Ctor for fn(*mut T) {
-    type Output = T;
-    unsafe fn ctor(self, dest: *mut Self::Output) {
-        (self)(dest)
-    }
-}
-```
-
-**Why it's here:** This is a similar pattern that uses richer library features to specifically target performance.
 
 ---
 
