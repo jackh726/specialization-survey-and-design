@@ -475,7 +475,7 @@ Two distinct causes hide under this one theme, and the reporters do not distingu
 **(b) `min_specialization` (or specialization) for inherent impls: 4 comments, 3 distinct askers,
 0 numbered issues.**
 U154 (@gnzlbg, 2019-08-28), U273 (@kalcutter, 2022-04-16), U277 (@Logarithmus, workaround), U278
-(@zirconium-n, rebuts the workaround). I searched rust-lang/rust for `inherent impl
+(a reply rebuts the workaround). I searched rust-lang/rust for `inherent impl
 specialization`, `min_specialization inherent`, `specialize inherent methods`, `E0592
 specialization`: **there is no numbered issue for this anywhere.** RFC 1210 has a section on it; it
 has only ever been requested in this thread; it fails with E0592 identically under `specialization`

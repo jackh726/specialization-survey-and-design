@@ -12,7 +12,8 @@ That last part is also a check on the entry: a desired use with no account of it
 flag, because it is probably either actually shipped (and belongs in the use-case catalogue, not
 here) or not really a use. Where a use would need some feature or extension that does not exist, that
 is described *in general* - the shape of the missing capability - rather than as a specific design;
-the design space is catalogued separately.
+the design space is catalogued separately. Each entry ends with a **Needs:** line naming that
+capability, so a use can be read straight through to the feature work it implies.
 
 Code snippets are not expected to compile; they are simply examples written to show what the
 requested behavior may look like. Each entry links its own evidence inline: a forum thread, a tracker
@@ -49,9 +50,75 @@ hand-written `False`-trait encodings that do not reliably work (one was reported
 should be accepted are also being rejected"*,
 [#24412](https://internals.rust-lang.org/t/negative-trait-bounds-using-feature-specialization/24412)).
 
-In general this needs a way to reason about a trait a type does *not* implement - negative reasoning,
-a different feature from specialization. The same want in argument position is an API that accepts
-only types *without* a capability, e.g. `fn take<T: !Copy>(t: T)` to enforce a move-only invariant.
+**Needs:** negative reasoning - a way for an impl to apply only where a type does *not* implement
+some trait, or is not some other type. That is a different feature from specialization, and because
+the two impls only partially overlap, specialization's ordering would not resolve this even if it
+shipped. The same want in argument position is an API that accepts only types *without* a
+capability, e.g. `fn take<T: !Copy>(t: T)` to enforce a move-only invariant.
+
+---
+
+## Lift a conversion over a generic container
+
+**What:** convert `C<T>` into `C<U>` by converting the contents, with one impl rather than one per
+pair: `Option<T>` to `Option<U>`, `Vec<T>` to `Vec<U>`, `Wrapper<T>` to `Wrapper<U>`, so that
+`.into()` works on the container the way it works on the element.
+
+**Why:** ergonomics. It is asked of `std` for `Option` and `Vec`, and the same shape recurs in
+every crate that has a generic wrapper.
+
+```rust
+impl<T, U> From<Option<T>> for Option<U> where T: Into<U> {
+    fn from(o: Option<T>) -> Option<U> { o.map(Into::into) }
+}
+```
+
+**Why it isn't found as a shipped use:** it is unutterable, and for two independent reasons that the
+`Option` case happens to trip at once.
+
+*The reflexive collision.* Where both sides share a type constructor, the impl covers the diagonal
+`C<T>` to `C<T>`, which `core`'s `impl<T> From<T> for T` already covers, so E0119. Neither impl is a
+subset of the other - the reflexive one also covers `u8` to `u8`, which the lift does not - so this
+is partial overlap, and impl ordering has nothing to resolve. It bites `std` itself as much as
+downstream crates: the ask for `impl<T, U: From<T>> From<Vec<T>> for Vec<U>` was answered *"this impl
+would overlap and thus conflict with the reflexive `impl<T> From<T> for T`"*, and separately *"`From`
+impls like this are widely desired ... but can't happen yet"*
+([#19116](https://internals.rust-lang.org/t/impl-t-u-from-t-from-vec-t-for-vec-u/19116)). The
+`Option` version got the same answer
+([#19442](https://internals.rust-lang.org/t/blanket-implementation-for-impl-t-u-into-t-into-option-t-for-option-u/19442)),
+and so did the user-wrapper versions: `From<Control<M>> for Control<N>` over a `Mode` parameter
+([#74336](https://users.rust-lang.org/t/cannot-impl-t-u-from-type-t-for-type-u/74336)),
+`From<Vec3<B>> for Vec3<A> where A: From<B>`
+([#42861](https://github.com/rust-lang/rust/issues/42861)), and `From<Wrapper<T>> for Wrapper<U>`,
+which is one of the two motivating examples for a proposed `T != U` bound
+([#22881](https://internals.rust-lang.org/t/t1-t2-type-non-equality-bound/22881)).
+
+*The orphan rule.* Where the container is foreign, the impl is not the crate's to write at all,
+whatever happens to the overlap: `impl<T, U> From<Option<T>> for Option<U>` has no local type ahead
+of its uncovered parameters, so E0117. The same wall stands in the other direction, converting *into*
+a foreign type: `impl<T: BasicDatum> TryFrom<T> for i32` draws E0119 against `core`'s
+`impl<T, U: Into<T>> TryFrom<U> for T` *and* E0210 for the orphan violation, and the thread ends with the author giving up
+on the conversion traits entirely - *"I think I will simply not use `From`/`Into` and
+`TryFrom`/`TryInto`"*
+([#67824](https://users.rust-lang.org/t/generic-impl-tryfrom-impossible-due-to-orphan-rules-what-should-i-do/67824)).
+
+Two boundaries are worth stating precisely, because the wall is narrower than it is usually
+described. `impl<T> From<T> for MyWrapper<T>` is *accepted*: `T` can never equal `MyWrapper<T>`, and
+coherence knows it. So is a lift between *different* constructors where one is local, such as
+`impl<T, U: From<T>> From<Vec<T>> for MyVec<U>`. What is unutterable is specifically the
+same-constructor lift, plus anything the orphan rule puts out of reach.
+
+There is also a standing objection to fixing this with specialization even if it shipped, from the
+same thread: *"specialization is used in the standard library only for performance optimizations,
+not to write publicly visible trait implementations that are impossible without specialization"* - a
+publicly observable impl that exists only by specialization is a much larger commitment than an
+optimization that could be withdrawn.
+
+**Needs:** for the reflexive collision, a rule for partial overlap together with an intersection impl
+for the diagonal - `impl<T> From<C<T>> for C<T>`, which is a strict subset of the reflexive impl and
+so is orderable once the partial overlap itself is admitted. Negative reasoning is the alternative
+route people actually ask for, as a `where T != U` bound. For foreign containers, neither helps: that
+half is a question about the scope of the orphan rule, and no specialization design touches it.
 
 ---
 
@@ -83,10 +150,10 @@ match catch_unwind(handler) {
 
 Asked since 2016 - *"Debug of Any could delegate Debug impl to the real object if object actually
 implements Debug"* ([#4029](https://internals.rust-lang.org/t/specialization-for-better-debug-for-any/4029)).
-In general this is a reflection question asked of an erased value - "does the real type behind this
-`dyn Any` implement `Debug`?" - not a specialization question; the nightly `try_as_dyn` probe is its
-natural home but does not yet answer for `dyn` self types
-([#144361](https://github.com/rust-lang/rust/issues/144361)).
+**Needs:** reflection on an already-erased value - "does the real type behind this `dyn Any`
+implement `Debug`?" - which is not a specialization question at all, because there is no impl left to
+specialize. The nightly `try_as_dyn` probe is its natural home but does not yet answer for `dyn` self
+types ([#144361](https://github.com/rust-lang/rust/issues/144361)).
 
 ---
 
@@ -113,8 +180,9 @@ the same shape blocks `AsRef<T> for T` alongside the lifting impl over `&T`, and
 where T: Ord` alongside the reference-lifting impls (the live `std` case is
 [#45742](https://github.com/rust-lang/rust/issues/45742)).
 
-In general this needs the compiler to resolve *partially* overlapping impls, given an impl for the
-region where they overlap - more than specialization's strict-subset rule allows.
+**Needs:** a rule for *partially* overlapping impls: accept both, given an impl covering the region
+where they overlap. That is strictly more than specialization's strict-subset ordering allows, and
+the RFC that proposes the ordering names it only as a possible later addition.
 
 ---
 
@@ -142,8 +210,9 @@ That is a users.rust-lang thread nearly verbatim - *"For bigger matrices, I want
 this only works when the base case is a *concrete* size named as its own type (`Const<0>`, `[T; 1]`),
 because there is no way to make impls overlap on a *predicate over a const value* (`N <= 3`).
 
-In general this needs specialization to be able to order impls by a const value, not only by type
-structure.
+**Needs:** impl ordering that can consult a const value, not only type structure. Everything else
+here is ordinary specialization; the single missing piece is that `N <= 3` cannot make one impl more
+specific than another.
 
 ---
 
@@ -161,8 +230,8 @@ has an unconditional impl that overlaps a bounded `[T; N]` impl without either b
 same shape is [#94313](https://github.com/rust-lang/rust/issues/94313): `[T; 0]` is not `Copy`/`Clone`
 for non-`Copy` `T`.
 
-In general this is the partial-overlap problem again, wearing a const hat: it needs both the ability
-to special-case a const value and a rule for overlaps that are not strict subsets.
+**Needs:** both of the preceding capabilities at once - ordering by a const value, *and* a rule for
+overlaps that are not strict subsets. This is the partial-overlap problem wearing a const hat.
 
 ---
 
@@ -189,8 +258,9 @@ parameter equals the element type - which no impl-ordering rule expresses. The t
 even wants `&'static str` distinguished from `&'a str`, which runs straight into the compiler's
 inability to dispatch on lifetimes.
 
-In general this is type-level computation over type identity, a decision procedure that impl selection
-cannot reach - adjacent to specialization but not the same feature.
+**Needs:** a decision procedure over type identity, evaluated somewhere impl selection cannot reach,
+plus the ability to branch on a lifetime the compiler deliberately erases. Adjacent to
+specialization, but not the same feature.
 
 ---
 
@@ -215,9 +285,10 @@ helper trait - but that workaround cannot change the compile-time `needs_drop` a
 reporting `false` for the no-drop case
 ([#12873](https://internals.rust-lang.org/t/can-we-fix-drop-to-allow-specialization/12873)).
 
-In general the capability to build here is bounds on `Drop` (or an overridable destructor), not
-specialization: the blocker is that `needs_drop` feeds other reasoning and cannot be allowed to vary
-with generics ([#46893](https://github.com/rust-lang/rust/issues/46893)).
+**Needs:** bounds on `Drop` (or an overridable destructor) *and* a `needs_drop` that follows them.
+Not specialization: the blocker is that `needs_drop` feeds other reasoning and so cannot be allowed
+to vary with generics ([#46893](https://github.com/rust-lang/rust/issues/46893)). A helper trait
+fakes the first half and can never fake the second.
 
 ---
 
@@ -239,8 +310,9 @@ impl<T: IsZst> CapRepr for T { type Cap = (); }        // a Vec<()> needs no cap
 type-varying associated field would help and also where it is hardest: choosing a field's type this
 way destroys the container's variance.
 
-In general this wants an associated type chosen per instantiation used in *field* position - the
-sharp edge of the same `default type` machinery that already works in return position.
+**Needs:** an associated type chosen per instantiation and usable in *field* position. That is the
+sharp edge of the same per-impl associated-type machinery that already works in return position, and
+the position is what makes it hard: a field's type is what fixes the container's variance.
 
 ---
 
@@ -259,9 +331,11 @@ long time"* ([#20836](https://internals.rust-lang.org/t/unsafe-specialization/20
 keeps these paths behind private, unimplementable marker traits, and the ecosystem's answer is to
 vendor the container (16 such crates in the survey).
 
-In general this asks for two things: that a specialized fast path be reachable by downstream code at
-all, and a deliberate decision about whether `std` exposes its markers - which is entangled with the
-soundness of specializing on a safe trait, not only with stabilization timing.
+**Needs:** two things. That a specialized fast path be reachable by downstream code at all, which
+would take specializing an inherent method without inventing a trait for it, or overriding a blanket
+impl belonging to an upstream crate. And a deliberate decision about whether `std` exposes its
+markers, which is entangled with the soundness of specializing on a safe trait, not only with
+stabilization timing.
 
 ---
 
@@ -278,8 +352,10 @@ stable"* and *"return `impl ExactSizeIterator` … once specialization is stable
 backend is `BoundedReadWords`. Shipped code works around it with a parallel `SizeHint` trait
 (`portable-io`).
 
-In general this wants a trait's *provided* default body to be overridable for some types - which
-today forces either copying the body into an impl or inventing a parallel trait.
+**Needs:** a trait's *provided* default body to be overridable for some types, which today forces
+either copying the body into an impl or inventing a parallel trait. Where the method is inherent
+rather than a trait method, it also needs specializing an inherent method without inventing a trait
+to hang it on.
 
 ---
 
@@ -311,3 +387,7 @@ from 2023 to today implements `Ctor` with a `SelfCtor` auto trait and `impl !Sel
 specialization of `Ctor`, and will go away if we ever get a useful form of specialization."* So the
 want is real and shipped; what is missing is a stable, sound form of the specialization it would
 otherwise use.
+
+**Needs:** no new capability - specialization as designed, stabilized on a footing sound enough that
+a correctness-bearing public API can rest on it. This entry is here because the demand is real and
+the shipped code fakes it, not because the feature as designed would fall short.

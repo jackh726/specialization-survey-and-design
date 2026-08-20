@@ -209,7 +209,8 @@ nothing to order.
 
 ## The lattice rule: impls that overlap without either being more specific
 
-Serves: the value-or-closure (`ByNeed`) and fixed-size-array uses (DESIRED-USE-CASES.md).
+Serves: the value-or-closure (`ByNeed`), fixed-size-array, and conversion-lifting uses
+(DESIRED-USE-CASES.md).
 
 RFC 1210's Limitations section is a list of these, and the RFC is explicit that *none* of them are
 permitted by the rule it proposes. The `ByNeed` example is the sharpest, because it is an API people
@@ -245,6 +246,28 @@ impl<T: A> Render for T      { default fn render(&self) -> String { /* via A */ 
 impl<T: B> Render for T      { default fn render(&self) -> String { /* via B */ } }
 impl<T: A + B> Render for T  { fn render(&self) -> String { /* the combined form */ } }
 ```
+
+One shape not in the RFC is worth singling out, because of where it sits in the rule rather than
+because of what it is for: an impl of the form `impl<T, U> From<C<T>> for C<U>` partially overlaps
+`core`'s reflexive `impl<T> From<T> for T` on the diagonal, and its intersection impl is *writable*.
+
+```rust
+impl<T> From<T> for T { /* core */ }                                     // parent
+impl<T, U> From<C<T>> for C<U> where T: Into<U> { /* the lift */ }       // partial overlap
+impl<T> From<C<T>> for C<T> { /* the intersection: delegate to core */ } // child of both
+```
+
+That intersection impl is a strict subset of the reflexive one, so the chain rule already orders it;
+the lattice rule is the only missing piece. Nothing else in this section has that property. `ByNeed`
+and the `A` / `B` / `A + B` shape both need an intersection impl written from nothing, with no parent
+to delegate to, which is why they also raise the question of *what* the intersection should do. Here
+the answer is forced.
+
+Two limits on the reach of the rule are visible in the same shape. Coherence already admits
+`impl<T> From<T> for W<T>`, because `T` cannot equal `W<T>`, so the lattice rule is not needed
+wherever the overlap is already known to be empty. And where `C` is a foreign constructor the orphan
+rule rejects the impl before coherence is consulted (below), so admitting the overlap would not
+unblock it.
 
 **What it asks of the design:** the lattice rule, which RFC 1210 says is backwards compatible to add
 later and then declines, for a reason that is still the reason:
@@ -303,7 +326,7 @@ error of counting them as covered.
 
 ## Negative reasoning: dispatch on a trait the type does *not* implement
 
-Serves: the error-conversion use (DESIRED-USE-CASES.md).
+Serves: the error-conversion and conversion-lifting uses (DESIRED-USE-CASES.md).
 
 A crate wants every backend error to become its own error type so that `?` just works, and collides
 with `core`'s reflexive impl.
@@ -328,8 +351,23 @@ people write by hand, one of which was reported as *"the types that should be ac
 rejected"*
 ([#24412](https://internals.rust-lang.org/t/negative-trait-bounds-using-feature-specialization/24412)).
 
+The narrower form people ask for by name is type *dis*equality rather than a negative trait bound:
+a `where T != U` clause, proposed as *"there's no way to express that the implementation would apply
+only to `T != U`"*
+([#22881](https://internals.rust-lang.org/t/t1-t2-type-non-equality-bound/22881), 2025), and floated
+earlier as a per-type opt-out of the reflexive `From`
+([#42861](https://github.com/rust-lang/rust/issues/42861), 2017). It is the same feature seen from
+the coherence side, and it draws the same objection: the thread's own rebuttal is that a negative
+bound forces the compiler to choose an impl on a lifetime inequality it has already erased, which is
+root cause 1 in [ISSUES.md](ISSUES.md).
+
 The bound-position form of the same ask is an API that accepts only types *without* a capability:
-`fn take<T: !Copy>(t: T)`, to enforce a move-only invariant.
+`fn take<T: !Copy>(t: T)`, to enforce a move-only invariant. The trait-pair form is that two traits
+be declarable mutually exclusive so that `impl<T: A> Example<T>` and `impl<T: B> Example<T>` can both
+carry a `test` method
+([#24337](https://internals.rust-lang.org/t/mutually-exclusive-traits/24337), 2026;
+[#2126](https://internals.rust-lang.org/t/pre-rfc-mutually-exclusive-traits/2126) is the 2015
+version, so the ask is eleven years old and still gets *"no concrete plans"*).
 
 **What it asks of the design:** negative trait bounds, tracked as
 [#42721](https://github.com/rust-lang/rust/issues/42721) (bound side) and
@@ -339,6 +377,39 @@ uncallable. RFC 1210 considered negative bounds as the main alternative to speci
 rejected them as *fundamentally closed*: they let a trait author specialize up front but not a
 downstream crate. The objection is stability, not mechanics: with negative reasoning, adding an impl
 becomes a breaking change.
+
+## Orphan-rule scope: impls over a foreign type constructor
+
+Serves: the conversion-lifting use (DESIRED-USE-CASES.md).
+
+This is the half of the conversion-lifting demand that no specialization design reaches. Even with a
+lattice rule and negative reasoning both in hand, `impl<T, U> From<Option<T>> for Option<U>` stays
+unwritable outside `core`, because it has no local type ahead of its uncovered parameters:
+
+```rust
+// E0117 before coherence is ever consulted:
+impl<T, U> From<Option<T>> for Option<U> where T: Into<U> { /* ... */ }
+
+// and in the other direction, converting into a foreign primitive:
+impl<T: LocalTrait> TryFrom<T> for i32 { /* ... */ }  // E0210, on top of E0119
+```
+
+The locality of the constructor decides which feature is at issue, and the two answers do not
+substitute for each other. For a *local* one the whole story is the reflexive overlap, and the
+lattice rule or a `T != U` bound settles it. For a *foreign* one the impl belongs to the upstream
+crate whatever coherence decides, so the request can only be addressed by that crate. Counting the
+foreign half as specialization demand would overstate what stabilizing the feature buys; it is
+recorded here so the split is explicit.
+
+**What it asks of the design:** nothing of specialization; it lands in the orphan rule, where the
+open work is RFC 2451's re-rebalancing and the relaxation experiment
+([#136979](https://github.com/rust-lang/rust/issues/136979)). Worth noting the interaction in the
+other direction: because `std` is the only crate that *can* write these impls, and because a
+publicly observable impl written with specialization is a commitment `std` has so far declined to
+make - the standing answer on these threads is that specialization is used in the standard library
+only for performance optimizations, not to write publicly visible trait impls that are impossible
+without it - this demand is not served by stabilizing specialization alone, even for the foreign
+types where `std` holds the pen.
 
 ## Type-level computation over type identity
 
@@ -401,12 +472,12 @@ overridable destructor - is the thing to build.
 
 ## Varying an impl along constness
 
-Serves: the const-eval-available-fast-path use (DESIRED-USE-CASES.md).
+Serves: no entry in DESIRED-USE-CASES.md. The demand here is reported against the feature rather
+than as a want, so its evidence is the tracker issues below.
 
 Constness is not a dimension the specialization graph can vary along, in either direction. A
 non-const impl is not accepted as a child of a const impl
-([#147130](https://github.com/rust-lang/rust/issues/147130), which oli-obk calls working as
-intended), and the `[const]` condition on a specializing impl is never proven, so const evaluation
+([#147130](https://github.com/rust-lang/rust/issues/147130), closed as working as intended), and the `[const]` condition on a specializing impl is never proven, so const evaluation
 can reach a non-const function as a post-monomorphization error
 ([#148200](https://github.com/rust-lang/rust/issues/148200)).
 
@@ -424,7 +495,8 @@ question the const-value case raises, reached from the effect side rather than t
 
 ## Impls over every enum variant, treated as an impl over the enum
 
-Serves: the const-enum-dispatch use (DESIRED-USE-CASES.md).
+Serves: no entry in DESIRED-USE-CASES.md. As above, the demand arrives as a bug report against
+`adt_const_params`, not as a stated want.
 
 With `adt_const_params` a const parameter can be an enum. Writing an impl for every variant still
 does not make the generic case hold: the trait solver does not case-split an exhaustive
@@ -539,6 +611,7 @@ Checked against the RFC section by section, so that nothing it motivates is miss
 | Motivation / Groundwork: efficient inheritance | USE-CASES.md, pseudo-inheritance |
 | `default type` and the projection hazard | USE-CASES.md, in-place deserialization and a type-level `Option`; the hazard is ISSUES.md root causes 2 and 4 |
 | Limitations: `AsRef<T> for T` plus lifting over `&T` | here, the lattice rule (#45742) |
+| (not in the RFC) Lifting a conversion over a type constructor, `From<C<T>> for C<U>` | here, the lattice rule and the orphan-rule section; the use is DESIRED-USE-CASES.md |
 | Limitations: `ByNeed` | here, same section |
 | Limitations: `PartialOrd` from `Ord` plus lifting | here, same section |
 | Interaction with lifetimes | ISSUES.md root cause 1 (region erasure); the demand side is here, type-level computation |
